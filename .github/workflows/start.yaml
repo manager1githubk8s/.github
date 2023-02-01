@@ -1,0 +1,173 @@
+name: Start k8s worker
+on:
+  repository_dispatch:
+    types:
+      - worker/start/*
+      - worker/stop/*
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 16
+      - run: npm install @octokit/action
+      - run: npm install merge-util
+      - name: Get Worker
+        id: worker
+        continue-on-error: true
+        uses: actions/github-script@v6
+        if: github.event.client_payload.registe == true
+        with:
+          result-encoding: string
+          script: |
+            const fs = require('fs');
+            function getRandomInt(max) {
+              return Math.floor(Math.random() * max);
+            }
+
+            const worker_count = context.payload.client_payload.meta.worker.length;
+            const worker_info = context.payload.client_payload.meta.worker[getRandomInt(worker_count)];
+            fs.writeFileSync('worker.info', JSON.stringify(worker_info));
+      - run: |
+          MASTER_TOKEN=$(cat $GITHUB_EVENT_PATH | jq '.client_payload.meta.master.vpn_token' | sed 's/"//g' | sed 's/\\n/\n/g' )
+          echo "::add-mask::$MASTER_TOKEN"
+          echo "MASTER_TOKEN=$MASTER_TOKEN" >> $GITHUB_ENV
+
+          WORKER=$(cat worker.info | jq '.owner' | sed 's/"//g')
+          echo "::add-mask::$WORKER"
+          echo "worker=$WORKER" >> $GITHUB_ENV
+
+          REPO=$(cat worker.info | jq '.repo' | sed 's/"//g')
+          echo "::add-mask::$REPO"
+          echo "repo=$REPO" >> $GITHUB_ENV
+
+          WORKER_TOKEN=$(cat worker.info | jq '.token' | sed 's/"//g')
+          echo "::add-mask::$WORKER_TOKEN"
+          echo "WORKER_TOKEN=$WORKER_TOKEN" >> $GITHUB_ENV
+
+          WORKER_TIME=$(cat worker.info | jq '.work_time' | sed 's/"//g')
+          echo "::add-mask::$WORKER_TIME"
+          echo "WORKER_TIME=$WORKER_TIME" >> $GITHUB_ENV
+      - name: Registe vpn
+        id: vpn
+        if: github.event.client_payload.registe == true
+        uses: actions/github-script@v6
+        env:
+          GITHUB_TOKEN: ${{ env.MASTER_TOKEN }}
+        with:
+          result-encoding: string
+          script: |
+            const fs = require('fs');
+            const { Octokit } = require("@octokit/action");
+            const octokit = new Octokit();
+            const owner = 'justforlxz';
+            const repo = 'wireguard.configs';
+            const vpns = await octokit.request('GET /repos/{owner}/{repo}/contents/{path}{?ref}', {
+              owner,
+              repo,
+              path: 'nodes'
+            });
+            const usings = await octokit.request('GET /repos/{owner}/{repo}/contents/{path}{?ref}', {
+              owner,
+              repo,
+              path: 'using'
+            });
+            const result = vpns.data.filter(item => {
+              if (!item.name.endsWith('node')) {
+                  return false;
+              }
+              for (const file of usings.data) {
+                if (file.name === item.name) {
+                  return false;
+                }
+              }
+              return true;
+            });
+            if (result.length < 1) {
+              return;
+            }
+            const node = result[0];
+            await octokit.request('PUT /repos/{owner}/{repo}/contents/{path}', {
+              owner,
+              repo,
+              path: `using/${node.name}`,
+              message: `using ${node.name}`,
+              committer: {
+                name: 'justforlxz',
+                email: 'justforlxz@gmail.com'
+              },
+              content: ``
+            })
+            const value = await octokit.request('GET /repos/{owner}/{repo}/contents/{path}{?ref}', {
+              owner,
+              repo,
+              path: node.path
+            });
+            fs.writeFileSync(value.data.name, value.data.content);
+            return value.data.name;
+      - name: Start worker
+        continue-on-error: true
+        uses: actions/github-script@v6
+        if: github.event.client_payload.registe == true
+        env:
+          vpn: ${{ steps.vpn.outputs.result }}
+          GITHUB_TOKEN: ${{ env.WORKER_TOKEN }}
+        with:
+          script: |
+            const fs = require('fs');
+            const merge = require('merge-util');
+            const { vpn, worker, repo, work_time } = process.env;
+            const { Octokit } = require("@octokit/action");
+            const octokit = new Octokit();
+
+            if (vpn.length === '') {
+              return;
+            }
+
+            const client_payload = merge(context.payload.client_payload, {
+                meta: {
+                  connection: {
+                    wireguard: {
+                      iface: vpn,
+                      data: fs.readFileSync(vpn).toString().replace(/[\r\n]+/gm, '') 
+                    }
+                  }
+                }
+            });
+
+            await octokit.request('POST /repos/{owner}/{repo}/dispatches', {
+              owner: worker,
+              repo,
+              event_type: `node/${vpn}`,
+              client_payload,
+            })
+      - name: Unregiste vpn
+        if: github.event.client_payload.registe == false
+        uses: actions/github-script@v6
+        env:
+          GITHUB_TOKEN: ${{ env.MASTER_TOKEN }}
+        with:
+          script: |
+            const connection = context.payload.client_payload.meta.connection;
+            const vpn = connection.wireguard.iface;
+            const { Octokit } = require("@octokit/action");
+            const octokit = new Octokit();
+            const owner = 'justforlxz';
+            const repo = 'wireguard.configs';
+            const result = await octokit.request('GET /repos/{owner}/{repo}/contents/{path}{?ref}', {
+              owner,
+              repo,
+              path: `using/${vpn}`
+            });
+            return await octokit.request('DELETE /repos/{owner}/{repo}/contents/{path}', {
+              owner,
+              repo,
+              path: `using/${vpn}`,
+              message: 'unregiste vpn',
+              committer: {
+                name: 'justforlxz',
+                email: 'justforlxz@gmail.com'
+              },
+              sha: result.data.sha
+            })
